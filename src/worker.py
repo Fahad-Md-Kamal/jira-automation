@@ -4,7 +4,8 @@
 This script is intended to be launched by .git/hooks/pre-push. Git does not
 have a client-side post-push hook, so the pre-push hook starts this worker in
 the background. For Gerrit refs/for pushes, the worker can optionally wait for
-the change to appear and post a Gerrit comment.
+the change to appear and post a Gerrit comment. For hosted Git providers, the
+worker can add an existing or create-review URL to the Jira comment.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -26,13 +28,40 @@ from pathlib import Path
 
 
 ZERO_SHA = "0" * 40
-ISSUE_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
-DEFAULT_JIRA_ENV_FILES = (
-    Path(".env"),
-    Path(".jira.env"),
-    Path("backend/jira-script/.env"),
-    Path("backend/.env"),
-)
+
+# Broad fallback: any WORD-NUMBER token that looks like a Jira key.
+_ISSUE_KEY_BROAD_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
+# Minimum character length for a Jira project prefix to avoid false positives
+# such as single-letter tokens in some regex engines.
+_MIN_PREFIX_LEN = 2
+
+
+def _build_issue_key_re() -> re.Pattern[str]:
+    """Return a regex for Jira issue keys.
+
+    When PUSH_HOOK_JIRA_PROJECTS is set (comma-separated project prefixes,
+    for example ``P1732,MYAPP,OPEN``), the regex is anchored to those exact
+    prefixes so that generic tokens like ``UTF-8`` or ``HTTP-404`` are never
+    matched.
+
+    When the variable is absent or empty, the broad fallback is used, which
+    matches any ``UPPERCASE_WORD-NUMBER`` token.
+    """
+    raw = os.environ.get("PUSH_HOOK_JIRA_PROJECTS", "").strip()
+    if not raw:
+        return _ISSUE_KEY_BROAD_RE
+
+    prefixes = [
+        p.strip().upper()
+        for p in raw.split(",")
+        if len(p.strip()) >= _MIN_PREFIX_LEN
+    ]
+    if not prefixes:
+        return _ISSUE_KEY_BROAD_RE
+
+    alternation = "|".join(re.escape(p) for p in prefixes)
+    return re.compile(rf"\b((?:{alternation})-\d+)\b")
 
 
 @dataclass(frozen=True)
@@ -47,6 +76,12 @@ class GerritChange:
     number: str
     patchset: str
     url: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewLink:
+    label: str
+    url: str
 
 
 def run(
@@ -229,41 +264,168 @@ def commit_message(commit_sha: str, repo_root: Path) -> str:
     return git(["log", "-1", "--format=%B", commit_sha], cwd=repo_root).strip()
 
 
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].strip()
-        if "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-
-        if not key or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
-            continue
-        if key in os.environ:
-            continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-
-        os.environ[key] = value
+def parse_issue_keys(message: str) -> list[str]:
+    pattern = _build_issue_key_re()
+    keys: list[str] = []
+    for key in pattern.findall(message):
+        if key not in keys:
+            keys.append(key)
+    return keys
 
 
-def load_jira_env(repo_root: Path) -> None:
-    env_file = os.environ.get("JIRA_ENV_FILE")
-    if env_file:
-        load_env_file(Path(env_file).expanduser())
-        return
+def resolve_review_link(
+    change: GerritChange | None,
+    *,
+    remote_url: str,
+    branch: str | None,
+    repo_root: Path,
+) -> ReviewLink | None:
+    # 1. Explicit override always wins.
+    explicit = os.environ.get("PUSH_HOOK_REVIEW_URL") or os.environ.get("PUSH_HOOK_PR_URL")
+    if explicit:
+        return ReviewLink(label="Review", url=explicit)
 
-    for relative_path in DEFAULT_JIRA_ENV_FILES:
-        load_env_file(repo_root / relative_path)
+    # 2. Gerrit change URL.
+    if change and change.url:
+        return ReviewLink(label="Gerrit review", url=change.url)
+
+    repository_url = _repository_web_url(remote_url)
+    if not repository_url:
+        return None
+
+    if not branch:
+        return ReviewLink(label="Repository", url=repository_url)
+
+    provider = _review_provider(repository_url)
+
+    # 3. GitHub CLI: look up an open PR for the pushed branch.
+    if provider == "github" and shutil.which("gh"):
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "view", branch, "--json", "url", "--jq", ".url"],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            url = result.stdout.strip()
+            if url.startswith("http"):
+                return ReviewLink(label="GitHub PR", url=url)
+        except Exception:
+            pass
+
+    # 4. Fallback: construct the provider's create-review URL. For unknown
+    #    providers, still include the pushed repository in the Jira comment.
+    return _review_creation_link(provider, repository_url, branch) or ReviewLink(
+        label="Repository",
+        url=repository_url,
+    )
+
+
+def _repository_web_url(remote_url: str) -> str | None:
+    """Convert common Git remote formats to a repository web URL."""
+    explicit = os.environ.get("PUSH_HOOK_REPOSITORY_URL")
+    if explicit:
+        return _strip_git_suffix(explicit.rstrip("/"))
+
+    parsed = urllib.parse.urlparse(remote_url)
+    if parsed.scheme in {"http", "https", "ssh"}:
+        host = parsed.hostname
+        if not host:
+            return None
+        path = parsed.path.lstrip("/")
+        scheme = parsed.scheme if parsed.scheme in {"http", "https"} else "https"
+        return _repository_web_url_from_parts(host, path, parsed.port, scheme)
+
+    scp_like = re.match(r"(?:(?:[^@/:]+)@)?(?P<host>[^:/]+):(?P<path>.+)", remote_url)
+    if scp_like:
+        return _repository_web_url_from_parts(
+            scp_like.group("host"),
+            scp_like.group("path"),
+        )
+
+    return None
+
+
+def _repository_web_url_from_parts(
+    host: str,
+    path: str,
+    port: int | None = None,
+    scheme: str = "https",
+) -> str:
+    path = path.lstrip("/")
+    if host == "ssh.dev.azure.com" and path.startswith("v3/"):
+        parts = path.removeprefix("v3/").split("/", 2)
+        if len(parts) == 3:
+            organization, project, repository = parts
+            return (
+                f"https://dev.azure.com/{organization}/{project}/_git/"
+                f"{_strip_git_suffix(repository)}"
+            )
+
+    host_port = f"{host}:{port}" if port and port != 22 else host
+    return _strip_git_suffix(f"{scheme}://{host_port}/{path}".rstrip("/"))
+
+
+def _strip_git_suffix(value: str) -> str:
+    return value[:-4] if value.endswith(".git") else value
+
+
+def _review_provider(repository_url: str) -> str | None:
+    explicit = os.environ.get("PUSH_HOOK_REVIEW_PROVIDER", "").strip().lower()
+    aliases = {
+        "azure": "azure-devops",
+        "azure_devops": "azure-devops",
+        "github-enterprise": "github",
+        "gitlab-self-managed": "gitlab",
+    }
+    if explicit:
+        return aliases.get(explicit, explicit)
+
+    host = (urllib.parse.urlparse(repository_url).hostname or "").lower()
+    if host == "github.com" or host.startswith("github."):
+        return "github"
+    if host == "gitlab.com" or host.startswith("gitlab."):
+        return "gitlab"
+    if host == "bitbucket.org":
+        return "bitbucket"
+    if host == "dev.azure.com" or host.endswith(".visualstudio.com"):
+        return "azure-devops"
+    return None
+
+
+def _review_creation_link(
+    provider: str | None,
+    repository_url: str,
+    branch: str,
+) -> ReviewLink | None:
+    repository_url = repository_url.rstrip("/")
+    quoted_branch = urllib.parse.quote(branch, safe="/")
+
+    if provider == "github":
+        return ReviewLink(
+            label="Create GitHub PR",
+            url=f"{repository_url}/compare/{quoted_branch}?expand=1",
+        )
+    if provider == "gitlab":
+        query = urllib.parse.urlencode({"merge_request[source_branch]": branch})
+        return ReviewLink(
+            label="Create GitLab MR",
+            url=f"{repository_url}/-/merge_requests/new?{query}",
+        )
+    if provider == "bitbucket":
+        query = urllib.parse.urlencode({"source": branch})
+        return ReviewLink(
+            label="Create Bitbucket PR",
+            url=f"{repository_url}/pull-requests/new?{query}",
+        )
+    if provider == "azure-devops":
+        query = urllib.parse.urlencode({"sourceRef": f"refs/heads/{branch}"})
+        return ReviewLink(
+            label="Create Azure DevOps PR",
+            url=f"{repository_url}/pullrequestcreate?{query}",
+        )
+    return None
 
 
 def comment_body(
@@ -272,22 +434,24 @@ def comment_body(
     commit_sha: str,
     branch: str | None,
     change: GerritChange | None,
-    issue_key: str | None,
+    issue_keys: list[str],
+    review_link: ReviewLink | None,
 ) -> str:
-    if os.environ.get("POST_PUSH_COMMENT_INCLUDE_DETAILS", "0") != "1":
-        return message
+    include_details = os.environ.get("POST_PUSH_COMMENT_INCLUDE_DETAILS", "0") == "1"
 
-    lines = [
-        message,
-        "",
-        f"Commit: {commit_sha}",
-    ]
-    if branch:
-        lines.append(f"Branch: {branch}")
-    if issue_key:
-        lines.append(f"Jira: {issue_key}")
-    if change and change.url:
-        lines.append(f"Gerrit: {change.url}")
+    lines = [message.strip()]
+    if review_link:
+        lines.extend(["", f"{review_link.label}: {review_link.url}"])
+
+    if include_details:
+        lines.extend(["", f"Commit: {commit_sha}"])
+        if branch:
+            lines.append(f"Branch: {branch}")
+        if issue_keys:
+            lines.append(f"Jira: {', '.join(issue_keys)}")
+        if change and change.url:
+            lines.append(f"Gerrit: {change.url}")
+
     return "\n".join(lines).strip()
 
 
@@ -395,17 +559,11 @@ def jira_comment_url(issue_key: str) -> str | None:
 
 
 def should_post_jira_comment() -> bool:
-    value = os.environ.get("PUSH_HOOK_POST_JIRA_COMMENT")
-    if value is None:
-        value = os.environ.get("JIRA_POST_COMMIT_COMMENT", "1")
-    return value != "0"
+    return os.environ.get("PUSH_HOOK_POST_JIRA_COMMENT", "1") != "0"
 
 
 def should_post_gerrit_comment() -> bool:
-    value = os.environ.get("PUSH_HOOK_POST_GERRIT_COMMENT")
-    if value is None:
-        value = os.environ.get("GERRIT_POST_COMMIT_COMMENT", "0")
-    return value == "1"
+    return os.environ.get("PUSH_HOOK_POST_GERRIT_COMMENT", "0") == "1"
 
 
 def post_jira_comment(*, issue_key: str, body: str, dry_run: bool) -> None:
@@ -413,8 +571,8 @@ def post_jira_comment(*, issue_key: str, body: str, dry_run: bool) -> None:
     url = jira_comment_url(issue_key)
     if not url or not headers:
         print(
-            "Skipping Jira comment; set backend/jira-script/.env, JIRA_ENV_FILE, "
-            "or Jira env vars."
+            "Skipping Jira comment; export Jira environment variables in the OS "
+            "environment (JIRA_EMAIL/JIRA_API_TOKEN/JIRA_SITE or JIRA_CLOUD_ID)."
         )
         return
 
@@ -444,28 +602,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--wait-seconds",
         type=int,
-        default=int(
-            os.environ.get(
-                "PUSH_HOOK_GERRIT_WAIT_SECONDS",
-                os.environ.get("GERRIT_COMMENT_WAIT_SECONDS", "120"),
-            )
-        ),
+        default=int(os.environ.get("PUSH_HOOK_GERRIT_WAIT_SECONDS", "120")),
     )
     parser.add_argument(
         "--poll-seconds",
         type=int,
-        default=int(
-            os.environ.get(
-                "PUSH_HOOK_GERRIT_POLL_SECONDS",
-                os.environ.get("GERRIT_COMMENT_POLL_SECONDS", "5"),
-            )
-        ),
+        default=int(os.environ.get("PUSH_HOOK_GERRIT_POLL_SECONDS", "5")),
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
     repo_root = Path(git(["rev-parse", "--show-toplevel"], cwd=Path.cwd()))
-    load_jira_env(repo_root)
 
     branch = parse_target_branch(args.remote_ref)
     if args.local_sha == ZERO_SHA:
@@ -477,8 +624,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Skipping empty commit message for {args.local_sha}")
         return 0
 
-    issue_match = ISSUE_KEY_RE.search(message)
-    issue_key = issue_match.group(1) if issue_match else None
+    issue_keys = parse_issue_keys(message)
 
     is_gerrit_push = args.remote_ref.startswith("refs/for/")
     remote: GerritRemote | None = None
@@ -500,12 +646,19 @@ def main(argv: list[str] | None = None) -> int:
                 "skipping Gerrit comment."
             )
 
+    review_link = resolve_review_link(
+        change,
+        remote_url=args.remote_url,
+        branch=branch,
+        repo_root=repo_root,
+    )
     body = comment_body(
         message=message,
         commit_sha=args.local_sha,
         branch=branch,
         change=change,
-        issue_key=issue_key,
+        issue_keys=issue_keys,
+        review_link=review_link,
     )
 
     if is_gerrit_push and remote and change and should_post_gerrit_comment():
@@ -521,14 +674,19 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
 
-    if issue_key and should_post_jira_comment():
-        with_marker(
-            repo_root,
-            f"jira-{issue_key}-{args.local_sha}",
-            lambda: post_jira_comment(issue_key=issue_key, body=body, dry_run=args.dry_run),
-        )
+    if issue_keys and should_post_jira_comment():
+        for issue_key in issue_keys:
+            with_marker(
+                repo_root,
+                f"jira-{issue_key}-{args.local_sha}",
+                lambda issue_key=issue_key: post_jira_comment(
+                    issue_key=issue_key,
+                    body=body,
+                    dry_run=args.dry_run,
+                ),
+            )
 
-    if not issue_key:
+    if not issue_keys:
         print("No Jira issue key found in commit message.")
 
     return 0

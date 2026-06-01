@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 
+import jira_cli
 import worker
 from version import __version__
 
@@ -38,7 +39,23 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   if [[ "$local_sha" == "0000000000000000000000000000000000000000" ]]; then
     continue
   fi
-
+  require_key="${PUSH_HOOK_REQUIRE_TICKET_KEY:-0}"
+  commit_msg="$(git log -1 --format=%B "$local_sha" 2>/dev/null || true)"
+  if [[ "$require_key" == "1" ]]; then
+    projects="${PUSH_HOOK_JIRA_PROJECTS:-}"
+    if [[ -n "$projects" ]]; then
+      # Build alternation from comma-separated prefixes, e.g. P1732|MYAPP|OPEN
+      pattern="$(echo "$projects" | tr ',' '|' | tr -d ' ')"
+      regex="\\b(${pattern})-[0-9]+"
+    else
+      regex='\\b[A-Z][A-Z0-9]+-[0-9]+'
+    fi
+    if ! grep -Eq "$regex" <<< "$commit_msg"; then
+      echo "Push blocked: no Jira ticket key found in commit $local_sha." >&2
+      echo "Set PUSH_HOOK_REQUIRE_TICKET_KEY=0 to disable this check." >&2
+      exit 1
+    fi
+  fi
   log_file="$log_dir/$(date +%Y%m%d%H%M%S)-${local_sha:0:12}.log"
   nohup "${runner[@]}" \\
     --remote-name "$remote_name" \\
@@ -106,15 +123,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] == "worker":
-        return worker.main(argv[1:])
+  argv = list(sys.argv[1:] if argv is None else argv)
+  if argv and argv[0] == "worker":
+    return worker.main(argv[1:])
+  if not argv or argv[0] not in {"install", "--version", "-h", "--help"}:
+    return jira_cli.main(argv)
 
-    parser = build_parser()
-    args = parser.parse_args(argv)
+  parser = build_parser()
+  args = parser.parse_args(argv)
 
-    if args.command == "install":
-        return install_hook(Path(args.repo).expanduser())
+  if args.command == "install":
+    return install_hook(Path(args.repo).expanduser())
 
-    parser.print_help()
-    return 0
+  parser.print_help()
+  return 0

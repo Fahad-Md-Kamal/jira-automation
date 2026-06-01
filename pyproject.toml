@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jira-push-hook"
-version = "0.1.2"
-description = "Git pre-push hook that posts commit-message comments to Jira, with optional Gerrit support."
+version = "0.1.9"
+description = "Git pre-push hook that posts commit-message comments to Jira, with review links for common Git providers."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -23,7 +23,7 @@ jira-push-hook = "cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["cli", "worker", "version"]
+py-modules = ["cli", "jira_cli", "worker", "version"]
 
 [project.urls]
 Homepage = "https://github.com/Fahad-Md-Kamal/jira-automation"
