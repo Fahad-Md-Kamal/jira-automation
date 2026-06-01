@@ -1,0 +1,44 @@
+Packaged it.
+
+Created a shareable Python package at [packages/gerrit-jira-hook](/home/bjit/Desktop/zgm-cv/packages/gerrit-jira-hook/README.md) with:
+
+- `gerrit-jira-hook install`
+- `gerrit-jira-hook worker`
+- installable `pyproject.toml`
+- package README with team setup instructions
+- reusable worker code moved into [worker.py](/home/bjit/Desktop/zgm-cv/packages/gerrit-jira-hook/src/gerrit_jira_hook/worker.py)
+
+I kept the existing repo commands working:
+- [scripts/install_gerrit_after_push_hook.sh](/home/bjit/Desktop/zgm-cv/scripts/install_gerrit_after_push_hook.sh) now delegates to the package.
+- [scripts/gerrit_after_push_comment.py](/home/bjit/Desktop/zgm-cv/scripts/gerrit_after_push_comment.py) is now a compatibility wrapper.
+- `make gerrit-hook-install` installs the hook.
+- `make gerrit-hook-package` builds a wheel.
+
+Team install options:
+
+```bash
+python3 -m pip install --user ./packages/gerrit-jira-hook
+gerrit-jira-hook install
+```
+
+or:
+
+```bash
+pipx install ./packages/gerrit-jira-hook
+gerrit-jira-hook install
+```
+
+I also built and verified the wheel locally:
+
+```text
+packages/gerrit-jira-hook/dist/gerrit_jira_hook-0.1.0-py3-none-any.whl
+```
+
+Verification done:
+- Package CLI help works.
+- Wheel builds successfully.
+- Wheel installs successfully into an isolated target.
+- Installed `.git/hooks/pre-push` now uses the package with repo-local fallback.
+- Hook no-op path for non-`refs/for/*` pushes works.
+
+I did not run a real Gerrit push.
