@@ -1,44 +1,61 @@
-Packaged it.
+Jira Push Hook Packaging And Release Instructions
 
-Created a shareable Python package at [packages/gerrit-jira-hook](/home/bjit/Desktop/zgm-cv/packages/gerrit-jira-hook/README.md) with:
+Build package locally:
 
-- `gerrit-jira-hook install`
-- `gerrit-jira-hook worker`
-- installable `pyproject.toml`
-- package README with team setup instructions
-- reusable worker code moved into [worker.py](/home/bjit/Desktop/zgm-cv/packages/gerrit-jira-hook/src/gerrit_jira_hook/worker.py)
+1) Install build tools:
+.venv/bin/python -m pip install --upgrade build twine
 
-I kept the existing repo commands working:
-- [scripts/install_gerrit_after_push_hook.sh](/home/bjit/Desktop/zgm-cv/scripts/install_gerrit_after_push_hook.sh) now delegates to the package.
-- [scripts/gerrit_after_push_comment.py](/home/bjit/Desktop/zgm-cv/scripts/gerrit_after_push_comment.py) is now a compatibility wrapper.
-- `make gerrit-hook-install` installs the hook.
-- `make gerrit-hook-package` builds a wheel.
+2) Clean previous artifacts:
+rm -rf dist build src/*.egg-info
 
-Team install options:
+3) Build source and wheel:
+.venv/bin/python -m build
 
-```bash
-python3 -m pip install --user ./packages/gerrit-jira-hook
-gerrit-jira-hook install
-```
+4) Validate metadata:
+.venv/bin/python -m twine check dist/*
 
-or:
+Publish to TestPyPI:
 
-```bash
-pipx install ./packages/gerrit-jira-hook
-gerrit-jira-hook install
-```
+5) Configure ~/.pypirc with API tokens:
+[distutils]
+index-servers =
+    testpypi
+    pypi
 
-I also built and verified the wheel locally:
+[testpypi]
+username = __token__
+password = pypi-<your-testpypi-token>
 
-```text
-packages/gerrit-jira-hook/dist/gerrit_jira_hook-0.1.0-py3-none-any.whl
-```
+[pypi]
+username = __token__
+password = pypi-<your-pypi-token>
 
-Verification done:
-- Package CLI help works.
-- Wheel builds successfully.
-- Wheel installs successfully into an isolated target.
-- Installed `.git/hooks/pre-push` now uses the package with repo-local fallback.
-- Hook no-op path for non-`refs/for/*` pushes works.
+6) Upload artifacts to TestPyPI:
+.venv/bin/python -m twine upload -r testpypi dist/jira_push_hook-<version>-py3-none-any.whl dist/jira_push_hook-<version>.tar.gz
 
-I did not run a real Gerrit push.
+7) Verify install from TestPyPI:
+.venv/bin/python -m pip install --index-url https://test.pypi.org/simple/ --no-deps jira-push-hook
+jira-push-hook --help
+
+Publish to PyPI:
+
+8) Upload artifacts to production PyPI:
+.venv/bin/python -m twine upload dist/jira_push_hook-<version>-py3-none-any.whl dist/jira_push_hook-<version>.tar.gz
+
+9) Verify install from PyPI:
+.venv/bin/python -m pip install --upgrade jira-push-hook
+jira-push-hook --help
+
+Release rules:
+- Increase version in pyproject.toml before every new release.
+- Do not upload dist files generated from an old version.
+- PyPI versions are immutable and cannot be overwritten.
+- TestPyPI does not allow filename reuse even for deleted files. If you get HTTP 400 filename reuse, bump version and rebuild.
+
+Recovery commands for HTTP 400 filename reuse:
+- Update pyproject.toml version (example: 0.1.0 -> 0.1.1)
+- rm -rf dist build src/*.egg-info
+- .venv/bin/python -m build
+- .venv/bin/python -m twine check dist/*
+- .venv/bin/python -m twine upload -r testpypi dist/jira_push_hook-0.1.1-py3-none-any.whl dist/jira_push_hook-0.1.1.tar.gz
+- .venv/bin/python -m twine upload dist/jira_push_hook-0.1.1-py3-none-any.whl dist/jira_push_hook-0.1.1.tar.gz
