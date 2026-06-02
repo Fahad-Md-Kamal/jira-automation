@@ -139,3 +139,78 @@ class CommentBodyTests(TestCase):
             body,
             "ABC-1: change\n\nCreate GitLab MR: https://gitlab.example/new",
         )
+
+    def test_jira_comments_split_commit_message_and_url(self) -> None:
+        bodies = worker.jira_comment_bodies(
+            message="ABC-1: change",
+            review_link=worker.ReviewLink("Create GitLab MR", "https://gitlab.example/new"),
+        )
+
+        self.assertEqual(bodies, ["ABC-1: change", "https://gitlab.example/new"])
+
+
+class JiraCommentTests(TestCase):
+    def setUp(self) -> None:
+        environment = patch.dict(
+            os.environ,
+            {
+                "JIRA_EMAIL": "test@example.com",
+                "JIRA_API_TOKEN": "test-token",
+                "JIRA_CLOUD_ID": "test-cloud",
+            },
+            clear=True,
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_existing_comment_is_not_posted_again(self) -> None:
+        existing = worker.jira_adf_body("already posted")["body"]
+
+        with patch(
+            "worker.jira_request_json",
+            return_value={"comments": [{"body": existing}], "total": 1},
+        ) as request:
+            posted = worker.post_jira_comment(
+                issue_key="ABC-1",
+                body="already posted",
+                dry_run=False,
+            )
+
+        self.assertTrue(posted)
+        request.assert_called_once()
+        self.assertEqual(request.call_args.kwargs["method"], "GET")
+
+    def test_duplicate_lookup_checks_later_pages(self) -> None:
+        existing = worker.jira_adf_body("already posted")["body"]
+        first_page = {
+            "comments": [{"body": worker.jira_adf_body("different")["body"]}],
+            "total": 2,
+        }
+        second_page = {"comments": [{"body": existing}], "total": 2}
+
+        with patch("worker.jira_request_json", side_effect=[first_page, second_page]) as request:
+            posted = worker.post_jira_comment(
+                issue_key="ABC-1",
+                body="already posted",
+                dry_run=False,
+            )
+
+        self.assertTrue(posted)
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("startAt=1", request.call_args.kwargs["url"])
+
+    def test_new_comment_is_checked_then_posted(self) -> None:
+        with patch(
+            "worker.jira_request_json",
+            side_effect=[{"comments": [], "total": 0}, None],
+        ) as request:
+            posted = worker.post_jira_comment(
+                issue_key="ABC-1",
+                body="new comment",
+                dry_run=False,
+            )
+
+        self.assertTrue(posted)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].kwargs["method"], "GET")
+        self.assertEqual(request.call_args_list[1].kwargs["method"], "POST")

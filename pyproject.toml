@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jira-push-hook"
-version = "0.1.9"
+version = "0.1.10"
 description = "Git pre-push hook that posts commit-message comments to Jira, with review links for common Git providers."
 readme = "README.md"
 requires-python = ">=3.10"

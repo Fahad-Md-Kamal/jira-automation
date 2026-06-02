@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -253,7 +254,8 @@ def with_marker(repo_root: Path, marker_name: str, action) -> bool:
         return False
 
     try:
-        action()
+        if action() is False:
+            return False
         marker.write_text(str(int(time.time())) + "\n", encoding="utf-8")
         return True
     finally:
@@ -455,6 +457,19 @@ def comment_body(
     return "\n".join(lines).strip()
 
 
+def jira_comment_bodies(*, message: str, review_link: ReviewLink | None) -> list[str]:
+    """Return separate Jira comments for the commit message and pushed URL."""
+    bodies = [message.strip()]
+    if review_link and review_link.url not in bodies:
+        bodies.append(review_link.url)
+    return bodies
+
+
+def jira_comment_marker_name(issue_key: str, body: str) -> str:
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:20]
+    return f"jira-{issue_key}-{digest}"
+
+
 def post_gerrit_comment(
     *,
     remote: GerritRemote,
@@ -462,16 +477,17 @@ def post_gerrit_comment(
     body: str,
     repo_root: Path,
     dry_run: bool,
-) -> None:
+) -> bool:
     target = f"{change.number},{change.patchset}"
     remote_command = f"gerrit review --message {shlex.quote(body)} {shlex.quote(target)}"
     cmd = [*ssh_base(remote), remote_command]
     if dry_run:
         print("DRY RUN Gerrit command:")
         print(" ".join(shlex.quote(part) for part in cmd))
-        return
+        return False
     run(cmd, cwd=repo_root, timeout=30)
     print(f"Posted Gerrit comment on change {target}")
+    return True
 
 
 def jira_auth_headers() -> dict[str, str] | None:
@@ -566,7 +582,52 @@ def should_post_gerrit_comment() -> bool:
     return os.environ.get("PUSH_HOOK_POST_GERRIT_COMMENT", "0") == "1"
 
 
-def post_jira_comment(*, issue_key: str, body: str, dry_run: bool) -> None:
+def jira_comment_text(body: object) -> str:
+    """Extract plain text from a Jira comment body returned by REST API v2 or v3."""
+    if isinstance(body, str):
+        return body
+    if isinstance(body, list):
+        return "".join(jira_comment_text(item) for item in body)
+    if not isinstance(body, dict):
+        return ""
+    if body.get("type") == "hardBreak":
+        return "\n"
+    if isinstance(body.get("text"), str):
+        return body["text"]
+
+    content = body.get("content")
+    if not isinstance(content, list):
+        return ""
+    separator = "\n" if body.get("type") == "doc" else ""
+    return separator.join(jira_comment_text(item) for item in content)
+
+
+def jira_comment_exists(*, url: str, body: str, headers: dict[str, str]) -> bool:
+    start_at = 0
+    page_size = 100
+
+    while True:
+        query = urllib.parse.urlencode({"startAt": start_at, "maxResults": page_size})
+        payload = jira_request_json(method="GET", url=f"{url}?{query}", headers=headers)
+        if not isinstance(payload, dict):
+            return False
+
+        comments = payload.get("comments")
+        if not isinstance(comments, list):
+            return False
+
+        for comment in comments:
+            if isinstance(comment, dict) and jira_comment_text(comment.get("body")) == body:
+                return True
+
+        next_start = start_at + len(comments)
+        total = payload.get("total")
+        if not comments or not isinstance(total, int) or next_start >= total:
+            return False
+        start_at = next_start
+
+
+def post_jira_comment(*, issue_key: str, body: str, dry_run: bool) -> bool:
     headers = jira_auth_headers()
     url = jira_comment_url(issue_key)
     if not url or not headers:
@@ -574,22 +635,26 @@ def post_jira_comment(*, issue_key: str, body: str, dry_run: bool) -> None:
             "Skipping Jira comment; export Jira environment variables in the OS "
             "environment (JIRA_EMAIL/JIRA_API_TOKEN/JIRA_SITE or JIRA_CLOUD_ID)."
         )
-        return
+        return False
 
     payload = jira_adf_body(body)
 
     if dry_run:
         print(f"DRY RUN Jira POST: {url}")
         print(json.dumps(payload, indent=2))
-        return
+        return False
 
     try:
+        if jira_comment_exists(url=url, body=body, headers=headers):
+            print(f"Skipping duplicate Jira comment on {issue_key}")
+            return True
         jira_request_json(method="POST", url=url, body=payload, headers=headers)
     except urllib.error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Jira comment failed: HTTP {exc.code}: {details}") from exc
 
     print(f"Posted Jira comment on {issue_key}")
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -660,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
         issue_keys=issue_keys,
         review_link=review_link,
     )
+    jira_bodies = jira_comment_bodies(message=message, review_link=review_link)
 
     if is_gerrit_push and remote and change and should_post_gerrit_comment():
         with_marker(
@@ -676,15 +742,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if issue_keys and should_post_jira_comment():
         for issue_key in issue_keys:
-            with_marker(
-                repo_root,
-                f"jira-{issue_key}-{args.local_sha}",
-                lambda issue_key=issue_key: post_jira_comment(
-                    issue_key=issue_key,
-                    body=body,
-                    dry_run=args.dry_run,
-                ),
-            )
+            for jira_body in jira_bodies:
+                with_marker(
+                    repo_root,
+                    jira_comment_marker_name(issue_key, jira_body),
+                    lambda issue_key=issue_key, jira_body=jira_body: post_jira_comment(
+                        issue_key=issue_key,
+                        body=jira_body,
+                        dry_run=args.dry_run,
+                    ),
+                )
 
     if not issue_keys:
         print("No Jira issue key found in commit message.")

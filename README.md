@@ -102,10 +102,15 @@ export PUSH_HOOK_REVIEW_PROVIDER="gitlab"
 export PUSH_HOOK_REPOSITORY_URL="https://git.example.com/group/repo"
 ```
 
-Every push with a parseable remote includes a URL in the Jira comment. When no
+Every push with a parseable remote adds two separate Jira comments: one with
+the Git commit message and one containing only the URL. When no
 provider-specific review link can be built, the repository web URL is used.
 For local or unusual remotes that cannot be converted to a web URL, set
 `PUSH_HOOK_REPOSITORY_URL`.
+
+Before posting, the worker reads existing Jira comments and skips an exact text
+match. Local content-hash markers also prevent duplicate workers from posting
+the same comment during one push.
 
 ## Build A Wheel To Share
 
