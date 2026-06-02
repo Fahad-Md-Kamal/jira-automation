@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,14 +27,7 @@ mkdir -p "$log_dir"
 remote_name="${1:-}"
 remote_url="${2:-}"
 
-if command -v jira-push-hook >/dev/null 2>&1; then
-  runner=(jira-push-hook worker)
-elif command -v python3 >/dev/null 2>&1; then
-  runner=(python3 -m worker)
-else
-  echo "jira-push-hook is not installed and no Python fallback was found." >&2
-  exit 0
-fi
+runner=(__JIRA_PUSH_HOOK_RUNNER__)
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   if [[ "$local_sha" == "0000000000000000000000000000000000000000" ]]; then
@@ -83,6 +77,12 @@ def run_git(args: list[str], *, cwd: Path) -> str:
     return completed.stdout.strip()
 
 
+def render_hook() -> str:
+    worker_path = Path(worker.__file__).resolve()
+    runner = " ".join(shlex.quote(arg) for arg in [sys.executable, str(worker_path)])
+    return HOOK_TEMPLATE.replace("__JIRA_PUSH_HOOK_RUNNER__", runner)
+
+
 def install_hook(repo: Path) -> int:
     repo_root = Path(run_git(["rev-parse", "--show-toplevel"], cwd=repo)).resolve()
     hook_path = repo_root / ".git" / "hooks" / "pre-push"
@@ -94,7 +94,7 @@ def install_hook(repo: Path) -> int:
         shutil.copy2(hook_path, backup_path)
         print(f"Existing pre-push hook backed up to {backup_path}")
 
-    hook_path.write_text(HOOK_TEMPLATE, encoding="utf-8")
+    hook_path.write_text(render_hook(), encoding="utf-8")
     hook_path.chmod(0o755)
     print(f"Installed push-comment hook at {hook_path}")
     return 0
@@ -137,3 +137,7 @@ def main(argv: list[str] | None = None) -> int:
 
   parser.print_help()
   return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

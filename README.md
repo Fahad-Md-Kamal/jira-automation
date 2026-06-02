@@ -78,6 +78,10 @@ Install the optional `pre-push` hook in a repository:
 jira-push-hook install
 ```
 
+The installed hook records the package's Python interpreter and worker path so
+it works without an activated virtual environment. Run `jira-push-hook install`
+again in each repository after upgrading this package.
+
 That hook starts the packaged worker during pushes and writes logs under:
 
 ```text
